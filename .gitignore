@@ -1,0 +1,7 @@
+node_modules/
+试音/
+voice*/
+*.wav
+*.mp3
+*.m4a
+*.silk

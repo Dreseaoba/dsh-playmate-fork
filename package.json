@@ -1,0 +1,50 @@
+{
+  "name": "dsh-playmate",
+  "version": "0.1.0",
+  "description": "给 DeepSeek Harness 用的陪玩插件：看屏幕（含自动发现变化）/ 热键语音输入 / 把回答念出来。不附带任何声音模型。",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./locale/*": "./locale/*",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "slots"
+      ],
+      "external": [
+        "react"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "companion",
+    "screen",
+    "speech-to-text",
+    "tts",
+    "playmate"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}
