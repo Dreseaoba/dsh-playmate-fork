@@ -2,6 +2,8 @@
 
 给 DeepSeek Harness 用的陪玩插件：**看屏幕 / 听你说话 / 把回答念出来**。三个模块，全部开关式，默认全关。
 
+仓库：<https://github.com/ZiFeng11/dsh-playmate> · 许可证 MIT · 当前版本 0.1.0
+
 > **本插件不附带任何声音模型，也不附带任何参考音频。**
 > 「念出来」默认不可用——想让它说话，请自己准备 3–10 秒参考音，用 GPT-SoVITS / IndexTTS 之类自己克隆，
 > 然后把服务地址填进 `ttsUrl`。本插件不提供参考音，也不建议使用他人的声音。
@@ -53,7 +55,12 @@
 
 ## 安装
 
-1. 把本仓库放进 DSH 的 profile：`<profile>/node_modules/dsh-playmate`（目录联接 `mklink /J` 也行，改代码立刻生效）
+```bash
+git clone https://github.com/ZiFeng11/dsh-playmate
+```
+
+1. 把仓库放进 DSH 的 profile：`<profile>/node_modules/dsh-playmate`
+   （Windows 上用目录联接 `mklink /J` 更好：改代码立刻生效）
 2. 在 `<profile>/cordis.patch.yml` 末尾加：
 
 ```yaml
