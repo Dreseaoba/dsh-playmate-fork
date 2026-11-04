@@ -101,7 +101,8 @@ git clone https://github.com/ZiFeng11/dsh-playmate
 | `talkMode` | `ptt` \| `always` | `ptt` | 热键 / 一直听 |
 | `pythonPath` | string | `''` | 跑识别引擎的 python（建议绝对路径） |
 | `asrModel` | string | `iic/SenseVoiceSmall` | 识别模型，可换更大的 |
-| `vadThreshold` | 0.002–0.2 | `0.012` | 一直听模式的灵敏度（自动校准会覆盖） |
+| `vadThreshold` | 0.002–0.2 | `0.012` | 语音阈值**下限**（自动校准只会往上抬；放视频/戴耳机时调大） |
+| `msCacheDir` | 路径 | `''` | 识别模型缓存目录。留空用系统默认；若报 `model ... is not registered`，指到可写目录 |
 | `silenceMs` | 200–3000 | `700` | 静音多久算一句说完 |
 | `showPill` | `true` \| `false` | `false` | 录音时是否显示右下角小条（默认不显示） |
 | `hear` | bool | `false` | 念出来总开关 |
@@ -132,6 +133,10 @@ TTS 服务需要接受 `POST {text}`；如果你的服务另有 `/health`，环�
 | POST | `/api/playmate/ptt` | `{state:"start"\|"stop"}`（给浮窗/调试用） |
 
 ---
+
+## 切换模式很快
+
+「按住说话」和「一直听」之间的切换是**热切换**：识别模型只加载一次，切换时只改一个模式标记，通常 1 秒内麦克风状态就跟着变（不会重新加载模型）。
 
 ## 识别精度（重要，请先读）
 

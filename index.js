@@ -87,6 +87,8 @@ const DEFAULT_STATE = {
   showPill: false,
   /** 说：识别模型（默认 SenseVoiceSmall；想更准可以换更大的，见 README） */
   asrModel: 'iic/SenseVoiceSmall',
+  /** 说：模型缓存目录（留空=系统默认；有些机器默认目录写不进去，要指到可写盘） */
+  msCacheDir: '',
   /** 听：念多少字（默认 80，约 40 个汉字） */
   speakChars: 80,
   /** 看：手动（模型需要时才看）还是自动（画面变了就叫它看） */
@@ -167,6 +169,7 @@ const CONFIG_FIELDS = {
   targetMode: { kind: 'enum', values: ['auto', 'fixed'], label: '语音送到', hint: 'fixed=只进固定会话（防串台）；auto=跟随最近活动的会话' },
   targetSessionId: { kind: 'string', max: 120, label: '固定会话 id', hint: 'targetMode=fixed 时用；在下面的下拉里选' },
   showPill: { kind: 'enum', values: ['true', 'false'], label: '录音时显示小条', hint: 'false=不显示，只用提示音（热键模式下推荐）' },
+  msCacheDir: { kind: 'string', max: 400, label: '模型缓存目录', hint: '留空用系统默认；如果引擎报 model not registered，把它指到可写目录（例如 D:/mc/mscache）' },
   asrModel: { kind: 'string', max: 200, label: '识别模型', hint: '默认 iic/SenseVoiceSmall（快、够用）；长句同音字容易错，可换成更大的模型，见 README「识别精度」' },
   speakChars: { kind: 'number', min: 10, max: 600, label: '念多少字', hint: '默认 80（约 40 个汉字）；只念回答的开头这一段' },
   seeMode: { kind: 'enum', values: ['manual', 'auto'], label: '看屏幕的方式', hint: 'manual=模型判断需要时才看；auto=画面变化后自动送一帧进来（打游戏用这个）' },
@@ -787,20 +790,47 @@ function registerEar(ctx) {
 
     syncEar = async (on) => {
       if (!on) return await stop()
-      if (ear !== null && ear.alive()) ear.stop('换模式/换参数')
+      // **不要**先 stop()：stop 会把引擎杀掉，切模式就得重新加载模型（25–45 秒）。
+      // 交给 start() 判断：活着且模式不同 → 写模式文件热切换（<1 秒）；
+      // 没活着 → 才真的拉起。这条是 2026-11-04 "切一直听要等 44 秒" 的根因。
       return await ensure()
     }
 
     // 开机对齐：说开着就起，关着就确保没在跑
     void ensure()
     // 看门狗：引擎自己死了就再拉起来（20 秒一次，安静重试）
+    // 看门狗：带**退避**。以前每 20 秒硬拉一次，引擎起不来就变成"每 20 秒一个
+    // 新进程"，互相抢显存和端口，最后谁都活不了（2026-11-04 凌晨就是这么崩的）。
+    // 现在失败一次就等更久：30s → 60s → 120s → 300s 封顶；成功即清零。
+    let failCount = 0
+    let nextTryAt = 0
     watchdog = setInterval(() => {
       void (async () => {
         const state = readState()
         if (state.talk !== true) return
-        if (ear !== null && !ear.alive()) {
-          log('[dsh-playmate/ear] 引擎不在了，重新拉起')
-          await ensure()
+        const want = state.talkMode === 'always' ? 'always' : 'ptt'
+        const runningMode = ear === null ? '' : (typeof ear.mode === 'function' ? ear.mode() : '')
+        if (ear !== null && ear.alive() && runningMode === want) {
+          failCount = 0
+          return
+        }
+        // 活着但模式不对（比如切了 always，跑的还是 ptt）→ 也要重起
+        if (ear !== null && ear.alive() && runningMode !== '' && runningMode !== want) {
+          log(`[dsh-playmate/ear] 模式不一致（跑的是 ${runningMode}，要的是 ${want}），重起`)
+        }
+        const now = Date.now()
+        if (now < nextTryAt) return
+        log(`[dsh-playmate/ear] 引擎不在了，重新拉起（第 ${failCount + 1} 次）`)
+        const r = await ensure().catch((e) => ({ ok: false, error: String(e?.message ?? e) }))
+        const ok = r?.ok !== false && ear !== null && ear.alive()
+        if (ok) {
+          failCount = 0
+          nextTryAt = 0
+        } else {
+          failCount += 1
+          const wait = Math.min(300000, 30000 * 2 ** (failCount - 1))
+          nextTryAt = Date.now() + wait
+          log(`[dsh-playmate/ear] 拉起失败，${Math.round(wait / 1000)} 秒后再试`)
         }
       })().catch(() => {})
     }, 20000)

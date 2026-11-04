@@ -1,6 +1,6 @@
 {
   "name": "dsh-playmate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "给 DeepSeek Harness 用的陪玩插件：看屏幕（含自动发现变化）/ 热键语音输入 / 把回答念出来。不附带任何声音模型。",
   "type": "module",
   "main": "./index.js",
