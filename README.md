@@ -55,12 +55,42 @@
 
 ## 安装
 
+> **依赖先说清楚**：
+> - 「看屏幕」需要 **ffmpeg**（这个一定要有，否则那个开关会一直是关的）
+> - 「听我说话」需要 **Python**（能 `import numpy, sounddevice` 的解释器；有 GPU 更好）
+> - 「念出来」**不需要**装任何东西——它默认关着，等你填自己的 TTS 地址
+
+### 方式一：让 AI 帮你装（推荐）
+
+把下面这句发给你的 DSH（需要给它文件权限）：
+
+```
+请把 https://github.com/ZiFeng11/dsh-playmate 装进我的 DSH：
+克隆到 ~/.dsh/plugins/dsh-playmate，
+在 profiles/desktop/node_modules 下建目录联接，
+并在 cordis.patch.yml 里加一条 id: playmate 的 insert。
+装完告诉我怎么重启。
+```
+
+（`desktop` 换成你自己的 profile 名字。装完**要你自己重启 DSH**——AI 重启不了自己。）
+
+### 方式二：脚本（Windows）
+
+```powershell
+# 在仓库目录里
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+脚本会：找 profile → 克隆/更新到 `~\.dsh\plugins\dsh-playmate` → 建目录联接 → 写 patch（已写过就跳过，改前备份）。
+
+### 方式三：手动
+
 ```bash
 git clone https://github.com/ZiFeng11/dsh-playmate
 ```
 
-1. 把仓库放进 DSH 的 profile：`<profile>/node_modules/dsh-playmate`
-   （Windows 上用目录联接 `mklink /J` 更好：改代码立刻生效）
+1. 放（或联接到）`<profile>/node_modules/dsh-playmate`
+   Windows 上建议用目录联接：`mklink /J <profile>\node_modules\dsh-playmate <仓库路径>`
 2. 在 `<profile>/cordis.patch.yml` 末尾加：
 
 ```yaml
@@ -70,17 +100,9 @@ git clone https://github.com/ZiFeng11/dsh-playmate
     config: {}
 ```
 
-3. 重启 DSH。设置左侧栏会多一项「陪玩」。
+3. 重启 DSH，设置里会出现「陪玩」
 
-### 依赖
-
-- **ffmpeg**：看屏幕必需。放 PATH 里，或在设置里填绝对路径。
-- **python**：听我说话必需，且要能 `import numpy, sounddevice`（推荐用带 torch/funasr 的虚拟环境）。设置里填绝对路径最稳。
-- **TTS**：念出来必需，自己准备；插件只认一个 HTTP 地址。
-
-装完打开 `设置 → 陪玩 → 环境自检 → 检查环境`，四项全绿就可以用了。
-
----
+> 这个项目**没有上插件市场**，只从 GitHub 分发。装完点设置页里的「环境自检」，四个勾都绿了才算齐。
 
 ## 配置
 

@@ -48,5 +48,16 @@
   ],
   "engines": {
     "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZiFeng11/dsh-playmate.git"
+  },
+  "homepage": "https://github.com/ZiFeng11/dsh-playmate#readme",
+  "bugs": {
+    "url": "https://github.com/ZiFeng11/dsh-playmate/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
