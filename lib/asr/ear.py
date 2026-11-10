@@ -335,6 +335,55 @@ class Ear:
             self.transcribe_and_send(buf)
 
 
+def _host_addr(host):
+    """把 --host 拆成 (hostname, port)，容忍不带 scheme 的写法。"""
+    from urllib.parse import urlparse
+
+    s = (host or "").strip()
+    if "://" not in s:
+        s = "http://" + s
+    u = urlparse(s)
+    return (u.hostname or "127.0.0.1"), (u.port or (443 if u.scheme == "https" else 80))
+
+
+def host_watchdog(host, every=5.0, misses=3):
+    """宿主没了，本进程就跟着走。
+
+    Windows 不会级联杀子进程：DSH 一关，这里 spawn 出来的引擎就成了孤儿 ——
+    麦克风被占着，本机还多出一个找不到来路的 python 进程。更麻烦的是它锁着
+    claim_port 那个端口，下次 DSH 起来时新引擎抢不到就直接退出，表现成"一直
+    听没反应"，而日志里什么异常都没有。
+
+    multiprocessing 的父子链在 spawn 之后也断了，按 pid 追并不可靠，所以改成
+    问端口：宿主还听不听得到，比 pid 实在。连续 misses 次连不上就认定它走了。
+    """
+    import socket
+    import subprocess as _sp
+
+    h, p = _host_addr(host)
+    bad = 0
+    while True:
+        time.sleep(every)
+        try:
+            with socket.create_connection((h, p), timeout=2.0):
+                bad = 0
+                continue
+        except OSError:
+            bad += 1
+        log(f"宿主没响应（{bad}/{misses}）")
+        if bad < misses:
+            continue
+        log("宿主已退出，引擎跟着退")
+        _bye()
+        # taskkill 只有 Windows 有：/T 连子进程树一起收。其他平台这一步会静默
+        # 跳过，只靠下面的 os._exit 收掉自己。
+        try:
+            _sp.run(["taskkill", "/PID", str(os.getpid()), "/T", "/F"], capture_output=True)
+        except Exception:
+            pass
+        os._exit(0)
+
+
 def claim_port(port=7872):
     """单实例：抢一个本地端口。抢不到说明已经有引擎在跑，本进程直接退出。
     插件可能被两个 profile 各加载一次（注册两遍），多个引擎同时开同一个麦克风，
@@ -365,6 +414,7 @@ def main():
     import threading
 
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    threading.Thread(target=host_watchdog, args=(a.host,), daemon=True).start()
     holder = claim_port()
     if holder is None:
         return
