@@ -117,9 +117,12 @@ class Ear:
         # 之类的东西，实测会报 "No module named 'funasr.models.decoder'"）。
         # 想强制换模型就用 PLAY_ASR_MODEL。
         target = self.model_name or os.environ.get("PLAY_ASR_MODEL", "") or "iic/SenseVoiceSmall"
+        # 推理设备：cuda（默认）/ cpu。cpu 不占显存，适合和游戏抢显卡的机器；
+        # SenseVoiceSmall 是非自回归模型，CPU 上也能跑，只是慢一些。
+        device = (os.environ.get("PLAY_ASR_DEVICE", "") or "cuda").strip().lower() or "cuda"
         t0 = time.time()
-        self.model = AutoModel(model=target, disable_update=True, device="cuda")
-        log(f"模型来源：{target}")
+        self.model = AutoModel(model=target, disable_update=True, device=device)
+        log(f"模型来源：{target}（device={device}）")
         log(f"识别模型就绪（{time.time() - t0:.1f}s；模式={self.mode}；阈值={self.threshold}）")
 
     def asr(self, audio):

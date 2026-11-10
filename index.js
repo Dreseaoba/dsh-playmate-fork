@@ -75,6 +75,8 @@ const DEFAULT_STATE = {
   talkMode: 'ptt',
   /** 说：跑 ear.py 的 python（留空 = PATH 里的 python） */
   pythonPath: '',
+  /** 说：推理设备 —— cuda（默认，快、占约 1.1 GB 显存）/ cpu（不占显存，慢一些） */
+  asrDevice: 'cuda',
   /** 说：麦克风能量阈值（越大越不灵敏） */
   vadThreshold: 0.012,
   /** 说：静音多少毫秒算一句话说完 */
@@ -164,6 +166,7 @@ const CONFIG_FIELDS = {
   workDir: { kind: 'string', max: 400, label: '工作目录', hint: '留空用系统临时目录' },
   talkMode: { kind: 'enum', values: ['ptt', 'always'], label: '识别方式', hint: 'ptt=按住说（松开才发）；always=一直听，说完自动发' },
   pythonPath: { kind: 'string', max: 400, label: 'python 路径', hint: '跑识别引擎用；留空走 PATH' },
+  asrDevice: { kind: 'enum', values: ['cuda', 'cpu'], label: '推理设备', hint: 'cuda=快、占约 1.1 GB 显存；cpu=不占显存、慢一些（打游戏想腾显存时切这个）' },
   vadThreshold: { kind: 'number', min: 0.002, max: 0.2, label: '麦克风灵敏度阈值', hint: '默认 0.012；环境吵就调大' },
   silenceMs: { kind: 'number', min: 200, max: 3000, label: '静音多久算说完(ms)', hint: '默认 700' },
   targetMode: { kind: 'enum', values: ['auto', 'fixed'], label: '语音送到', hint: 'fixed=只进固定会话（防串台）；auto=跟随最近活动的会话' },
@@ -345,7 +348,7 @@ export function apply(ctx) {
           Object.assign(state, check.patch)
           if (!writeState(state)) return sendJson(response, 500, { ok: false, error: 'state-write-failed' })
           // 模式/阈值这类参数是引擎**启动时**读的，改了必须重启引擎才生效
-          const needsEngineRestart = ['talkMode', 'vadThreshold', 'silenceMs', 'pythonPath'].some((k) => k in check.patch)
+          const needsEngineRestart = ['talkMode', 'vadThreshold', 'silenceMs', 'pythonPath', 'asrDevice'].some((k) => k in check.patch)
           const needsWatchRestart = ['seeMode', 'seeEvery', 'seeAutoDiff', 'seeMinGapSec', 'seePace'].some((k) => k in check.patch)
           if (needsWatchRestart && typeof syncWatch === 'function') {
             await syncWatch().catch(() => {})
