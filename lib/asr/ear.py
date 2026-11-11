@@ -203,6 +203,40 @@ MODE_FILE = pathlib.Path(os.environ.get("PLAY_EAR_MODE_FILE", str(_LOG_DIR / "ea
 # 字段改之前得先想清楚。写得也便宜——一句话最多改三次，不是轮询着写。
 STAGE_PATH = pathlib.Path(os.environ.get("PLAY_EAR_STAGE", str(_LOG_DIR / "ear.stage")))
 
+# ---- 我说话时抬门槛（本地专用，2026-11-10 加）---------------------------
+# 问题：TTS 播放的声音会经喇叭/耳机漏一点进麦克风（实测峰值约 0.026，低于
+# 0.04 的阈值，平时触发不了）。可一旦主人在说话，录音窗口打开，那点声音
+# 就一起被录进去，识别结果变成"她的话 + 我的话"混在一起。
+# 做法：edge-say 播放期间写一个旗标文件，这里读到就把门槛抬起来。
+# 注意：这依赖本机的 edge-say 服务，属于"本地专用"而不是发给别人的 feature，
+# 所以它不进任何 PR 分支，只在本地基线上。
+SPEAK_FLAG = os.environ.get("SAY_FLAG", str(_LOG_DIR / "tts-speaking.flag"))
+TTS_BOOST_THRESHOLD = 0.10
+# 另一条线：我说话时，"这拍要不要录进缓冲区"用的是更低的门槛。
+# 两件事不能共用一个数（2026-11-10 踩过）：她在我说话中间接话，后半句音量
+# 掉到 0.10 以下就被当成我的漏音丢掉，句子被拦腰截断。
+# 我的漏音峰值约 0.03，所以 0.05 足够分开。
+TTS_APPEND_FLOOR = 0.05
+
+_tts_cache = {"t": 0.0, "v": False}
+
+
+def tts_is_playing():
+    """我是不是正在说话。带 0.5 秒缓存，别每拍都去 stat 一次文件。"""
+    now = time.time()
+    if now - _tts_cache["t"] < 0.5:
+        return _tts_cache["v"]
+    playing = False
+    try:
+        st = os.stat(SPEAK_FLAG)
+        # 文件在、而且是最近写的才算——防止进程崩了留下残骸把门槛一直抬着
+        playing = (now - st.st_mtime) < 60
+    except Exception:
+        playing = False
+    _tts_cache["t"] = now
+    _tts_cache["v"] = playing
+    return playing
+
 
 def desired_mode(fallback):
     try:
@@ -426,7 +460,8 @@ class Ear:
                     log(f"电平峰值 {peak:.4f}（阈值 {threshold:.4f}）")
                     peak, last_report = 0.0, time.time()
 
-                loud = level >= threshold
+                # 我说话的时候抬门槛，别把自己的声音录进去（见 tts_is_playing）
+                loud = level >= (TTS_BOOST_THRESHOLD if tts_is_playing() else threshold)
                 if not speaking:
                     # 连续两拍够响才算"开口"：单拍也可能是咔哒声
                     if loud:
@@ -439,7 +474,14 @@ class Ear:
                         voiced = 0
                     continue
                 # 已经在说话：攒帧，静音够了就收尾
-                buf.append(mono)
+                # 关键（2026-11-10）：我这边开始说话的时候，静音的拍不进缓冲区。
+                # 原因：她说完后进 1.5 s 静音等待，这段时间我的 TTS 已经在播了，
+                # 那点漏音（0.02~0.03）不算 loud、却照样被 append 进来，
+                # 结果整段送去识别时把「我说的话」也一起转写了。
+                # 我说话时：静音拍不进缓冲区，但留一个低门槛，别把她接话的
+                # 后半句（音量可能掉到 0.08 以下）整段吃掉。见 TTS_APPEND_FLOOR。
+                if loud or (not tts_is_playing()) or level >= TTS_APPEND_FLOOR:
+                    buf.append(mono)
                 quiet = 0 if loud else quiet + 1
                 if quiet >= self.silence_blocks or len(buf) >= self.max_blocks:
                     log(f"一句结束（{len(buf) * BLOCK:.1f}s）")
