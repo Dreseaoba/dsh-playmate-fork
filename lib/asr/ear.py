@@ -198,6 +198,10 @@ HB_PATH = pathlib.Path(os.environ.get("PLAY_EAR_HEARTBEAT", str(_LOG_DIR / "ear.
 # 模式文件：ptt / always。改了它，引擎**不用重启**就能换模式
 # （重启一次要重新加载模型，25 秒；换文件是毫秒级）
 MODE_FILE = pathlib.Path(os.environ.get("PLAY_EAR_MODE_FILE", str(_LOG_DIR / "ear.mode")))
+# 阶段文件：此刻「话筒到嘴」走到哪一步，宿主在 /api/playmate/stage 里读它。
+# 为什么不读日志：日志格式是内部细节，谁也没承诺过它稳定；这个文件是给外面看的契约，
+# 字段改之前得先想清楚。写得也便宜——一句话最多改三次，不是轮询着写。
+STAGE_PATH = pathlib.Path(os.environ.get("PLAY_EAR_STAGE", str(_LOG_DIR / "ear.stage")))
 
 
 def desired_mode(fallback):
@@ -215,6 +219,23 @@ def beat():
     try:
         HB_PATH.parent.mkdir(parents=True, exist_ok=True)
         HB_PATH.write_text(f"{os.getpid()} {time.time():.1f}", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def stage(name, detail=""):
+    """把当前阶段写出去，给宿主和外部（桌宠之类）看。
+
+    写失败绝不影响听 —— 这条路本来就是"有了更好，没有也得能说话"。
+    ts 用毫秒：宿主按它判"这条状态还新鲜吗"，过期的就当没发生，不会卡在某个态上。
+    """
+    try:
+        STAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STAGE_PATH.write_text(
+            json.dumps({"stage": name, "ts": int(time.time() * 1000), "detail": str(detail)},
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
     except Exception:
         pass
 
@@ -309,15 +330,17 @@ class Ear:
 
     def send(self, text):
         if not text:
-            return
+            return False
         body = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(self.host + "/api/playmate/heard", data=body,
                                      headers={"Content-Type": "application/json; charset=utf-8"})
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 log(f"发送 -> {r.read().decode('utf-8', 'ignore')[:120]}")
+                return True
         except Exception as e:
             log(f"发送失败：{e}")
+            return False
 
     @staticmethod
     def meaningful(text):
@@ -337,8 +360,10 @@ class Ear:
     def transcribe_and_send(self, buf):
         if len(buf) * BLOCK < 0.45:
             log(f"太短（{len(buf) * BLOCK:.2f}s），丢掉")
+            stage("idle", "too-short")
             return
         audio = np.concatenate(buf) if buf else np.zeros(0)
+        stage("transcribing", f"{len(buf) * BLOCK:.1f}s")
         # 长句切段识别，切点落在能量最低处（尽量对齐停顿）
         chunks = split_audio(audio)
         if len(chunks) > 1:
@@ -359,8 +384,14 @@ class Ear:
             text = fixed
         if not self.meaningful(text):
             log(f"没有实际内容（{text!r}），不发送")
+            stage("idle", "no-content")
             return
-        self.send(text)
+        if not self.send(text):
+            # 送不出去就别把状态停在「识别中」，否则外面看起来像卡住了
+            stage("idle", "send-failed")
+            return
+        # 送成功了也不写 delivered —— 那是宿主收到之后才写的事，
+        # 这一层只知道自己发出去了。宿主那边还没接住的空档，交给它自己判断。
 
     # ---- 常驻听 ----
     def run_always(self):
@@ -403,6 +434,7 @@ class Ear:
                         if voiced >= 2:
                             speaking, buf, quiet = True, [mono], 0
                             log(f"听到说话（{level:.3f}）")
+                            stage("listening", f"{level:.3f}")
                     else:
                         voiced = 0
                     continue
@@ -459,6 +491,7 @@ class Ear:
                 continue
             last = cmd
             log("按下：打开麦克风开始录")
+            stage("listening", "ptt")
             buf, speech_seen, quiet = [], False, 0
             threshold = 0.02
             done = False
@@ -506,6 +539,7 @@ class Ear:
                 continue
             if not speech_seen:
                 log("只录到底噪，没有讲话，丢掉")
+                stage("idle", "no-speech")
                 continue
             log(f"结束：{len(buf) * BLOCK:.1f}s，开始识别")
             self.transcribe_and_send(buf)
@@ -599,6 +633,7 @@ def main():
     ear = Ear(a.mode, a.host, a.ctl, a.threshold, a.silence_ms, a.max_sec, a.model)
     log(f"启动 mode={a.mode} host={a.host} th={a.threshold}")
     ear.load()
+    stage("idle", f"ready:{a.mode}")
     # 模型只加载一次；之后靠模式文件热切换（改文件 = 毫秒级，不用重启）
     mode = desired_mode(a.mode)
     while True:
