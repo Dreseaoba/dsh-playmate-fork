@@ -297,7 +297,7 @@ def rms(x):
 
 
 class Ear:
-    def __init__(self, mode, host, ctl, threshold, silence_ms, max_sec, model="iic/SenseVoiceSmall"):
+    def __init__(self, mode, host, ctl, threshold, silence_ms, max_sec, model="iic/SenseVoiceSmall", gain=1.0):
         self.model_name = model
         self.base_threshold = float(threshold) if threshold else 0.012
         self.mode = mode
@@ -306,7 +306,24 @@ class Ear:
         self.threshold = threshold
         self.silence_blocks = max(1, int(silence_ms / 1000 / BLOCK))
         self.max_blocks = int(max_sec / BLOCK)
+        # 数字增益：只放大「送给识别」的那份音频，VAD 判定仍然按原始电平。
+        # 为什么要分开：虚拟麦克风（远程控制软件装的那种）没有硬件增益，
+        # 音量滑杆到 100% 就是数字满刻度，实测说话只有 0.025 —— 判定能过，
+        # 但送进 SenseVoice 的音量太低，识别会糊。乘上去的是同一段声音，
+        # 阈值语义不变，就不用跟着改表。
+        try:
+            g = float(gain)
+        except (TypeError, ValueError):
+            g = 1.0
+        self.gain = g if g > 0 else 1.0
         self.model = None
+
+    def amp(self, x):
+        """把一段音频按增益放大，并防削波。gain=1 时原样返回。"""
+        if self.gain == 1.0:
+            return x
+        return np.clip(x * self.gain, -1.0, 1.0)
+
 
     def load(self):
         from funasr import AutoModel
@@ -467,7 +484,7 @@ class Ear:
                     if loud:
                         voiced += 1
                         if voiced >= 2:
-                            speaking, buf, quiet = True, [mono], 0
+                            speaking, buf, quiet = True, [self.amp(mono)], 0
                             log(f"听到说话（{level:.3f}）")
                             stage("listening", f"{level:.3f}")
                     else:
@@ -481,7 +498,7 @@ class Ear:
                 # 我说话时：静音拍不进缓冲区，但留一个低门槛，别把她接话的
                 # 后半句（音量可能掉到 0.08 以下）整段吃掉。见 TTS_APPEND_FLOOR。
                 if loud or (not tts_is_playing()) or level >= TTS_APPEND_FLOOR:
-                    buf.append(mono)
+                    buf.append(self.amp(mono))
                 quiet = 0 if loud else quiet + 1
                 if quiet >= self.silence_blocks or len(buf) >= self.max_blocks:
                     log(f"一句结束（{len(buf) * BLOCK:.1f}s）")
@@ -552,7 +569,7 @@ class Ear:
                     while not done:
                         blk, _ = stream.read(int(SR * BLOCK))
                         mono = blk[:, 0].copy()
-                        buf.append(mono)
+                        buf.append(self.amp(mono))
                         level = rms(mono)
                         if level >= threshold * 1.4:
                             speech_seen = True
@@ -662,6 +679,7 @@ def main():
     # 录音缓冲的硬上限，只在"一直有声音"时才起作用（正常说完静音 700 ms 就收尾）。
     # 它必须大于 MAX_CHUNK_SEC，否则永远攒不满一段、分段识别一次都跑不到。
     ap.add_argument("--max-sec", type=float, default=60)
+    ap.add_argument("--gain", type=float, default=float(os.environ.get("PLAY_EAR_GAIN", "1") or 1))
     ap.add_argument("--model", default=os.environ.get("PLAY_ASR_MODEL", "iic/SenseVoiceSmall"))
     a = ap.parse_args()
     beat()
@@ -672,8 +690,8 @@ def main():
     holder = claim_port()
     if holder is None:
         return
-    ear = Ear(a.mode, a.host, a.ctl, a.threshold, a.silence_ms, a.max_sec, a.model)
-    log(f"启动 mode={a.mode} host={a.host} th={a.threshold}")
+    ear = Ear(a.mode, a.host, a.ctl, a.threshold, a.silence_ms, a.max_sec, a.model, a.gain)
+    log(f"启动 mode={a.mode} host={a.host} th={a.threshold} gain={a.gain}")
     ear.load()
     stage("idle", f"ready:{a.mode}")
     # 模型只加载一次；之后靠模式文件热切换（改文件 = 毫秒级，不用重启）
