@@ -210,7 +210,11 @@ STAGE_PATH = pathlib.Path(os.environ.get("PLAY_EAR_STAGE", str(_LOG_DIR / "ear.s
 # 做法：edge-say 播放期间写一个旗标文件，这里读到就把门槛抬起来。
 # 注意：这依赖本机的 edge-say 服务，属于"本地专用"而不是发给别人的 feature，
 # 所以它不进任何 PR 分支，只在本地基线上。
-SPEAK_FLAG = os.environ.get("SAY_FLAG", str(_LOG_DIR / "tts-speaking.flag"))
+# 问 TTS「你正在出声吗」。地址由宿主传进来 —— 就是设置里那个 ttsUrl，
+# 不是写死的端口：换 TTS 服务、换端口，跟着配置走。
+# 为什么不再读旗标文件（2026-11-18）：文件落在哪要靠 tempfile.gettempdir() 猜，
+# 沙箱下那个目录不可写，两边各自退到自己的 cwd，永远对不上。
+TTS_URL = os.environ.get("PLAY_TTS_URL", "").strip().rstrip("/")
 TTS_BOOST_THRESHOLD = 0.10
 # 另一条线：我说话时，"这拍要不要录进缓冲区"用的是更低的门槛。
 # 两件事不能共用一个数（2026-11-10 踩过）：她在我说话中间接话，后半句音量
@@ -222,18 +226,27 @@ _tts_cache = {"t": 0.0, "v": False}
 
 
 def tts_is_playing():
-    """我是不是正在说话。带 0.5 秒缓存，别每拍都去 stat 一次文件。"""
+    """我是不是正在说话。带 0.5 秒缓存，别每拍都去问一次。
+
+    连不上就当「没在说话」：没有 TTS 就没有漏音，门槛该按正常值走。
+    反向（连不上就抬门槛）会让主人说话永远听不见，那种错更难发现。
+    失败后隔 2 秒再试，避免每拍都等满超时把录音节拍拖慢。
+    """
     now = time.time()
     if now - _tts_cache["t"] < 0.5:
         return _tts_cache["v"]
     playing = False
-    try:
-        st = os.stat(SPEAK_FLAG)
-        # 文件在、而且是最近写的才算——防止进程崩了留下残骸把门槛一直抬着
-        playing = (now - st.st_mtime) < 60
-    except Exception:
-        playing = False
-    _tts_cache["t"] = now
+    if TTS_URL:
+        base = TTS_URL[:-4] if TTS_URL.endswith("/say") else TTS_URL
+        try:
+            with urllib.request.urlopen(base + "/speaking", timeout=0.2) as r:
+                playing = bool((json.loads(r.read().decode("utf-8", "ignore")) or {}).get("speaking") is True)
+            _tts_cache["t"] = now
+        except Exception:
+            playing = False
+            _tts_cache["t"] = now + 1.5
+    else:
+        _tts_cache["t"] = now
     _tts_cache["v"] = playing
     return playing
 
