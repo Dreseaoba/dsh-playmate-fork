@@ -12,12 +12,13 @@
  * 重要：插件**不含任何声音模型与参考音频**。"听"默认返回 501 未配置，
  * 要用请自己准备参考音克隆（见 README）。
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { createPttWindow } from './lib/ptt-window.mjs'
 import { sessionLabel } from './lib/session-label.mjs'
 import { createHear } from './lib/hear.mjs'
 import { createWatch } from './lib/watch.mjs'
+import { stageFile as earStageFile, heartbeatPath as earHeartbeatFile } from './lib/ear.mjs'
 import { homedir } from 'node:os'
 
 const API = '/api/playmate'
@@ -48,6 +49,40 @@ let syncEar = null
 
 /** 看屏幕的模式/参数变化后要重排自动循环：由 registerWatch 挂上来 */
 let syncWatch = null
+
+/**
+ * 「话筒到嘴」走到哪一步 —— 六个值，就只是名字。
+ * 不带颜色、不带文案、不带任何展示约定：谁要用谁自己映射，这里只说实话。
+ *
+ *   idle          没在收，也没在送
+ *   listening     麦克风正在收
+ *   transcribing  收起一段了，正在认
+ *   delivered     已经送进会话，等对面接
+ *   thinking      对面在跑（模型在生成）
+ *   speaking      正在念（TTS 已经出声）
+ */
+const STAGES = new Set(['idle', 'listening', 'transcribing', 'delivered', 'thinking', 'speaking'])
+
+/** 每个态最多能挂多久。过了就当没发生 —— 免得引擎崩了以后一直显示"在收"。 */
+const STAGE_TTL = {
+  idle: 60000,
+  listening: 120000,
+  transcribing: 60000,
+  delivered: 1500,   // 一闪就过去的话，外面根本看不见，所以留 1.5 秒
+  thinking: 120000,
+  speaking: 20000,
+}
+
+const stageState = { stage: 'idle', at: 0, detail: '', ttl: 0 }
+
+/** 记一次阶段。ttl 不传就按上面表里那个态的默认值。 */
+function setStage(name, detail = '', ttl = 0) {
+  if (!STAGES.has(name)) return
+  stageState.stage = name
+  stageState.at = Date.now()
+  stageState.detail = String(detail ?? '')
+  stageState.ttl = Number(ttl) || 0
+}
 
 const DEFAULT_STATE = {
   see: false,
@@ -81,6 +116,10 @@ const DEFAULT_STATE = {
   vadThreshold: 0.012,
   /** 说：静音多少毫秒算一句话说完 */
   silenceMs: 700,
+  /** 说：一句话最长几秒（一直有声音时的硬上限；必须大于分段阈值才有意义） */
+  maxSec: 60,
+  /** 说：麦克风数字增益（只放大送进识别的那份音频；1 = 不放大） */
+  talkGain: 1,
   /** 说：语音送到哪儿 —— fixed=固定会话 / auto=跟随最近活动 */
   targetMode: 'auto',
   /** 说：固定会话的 id（targetMode=fixed 时生效） */
@@ -91,8 +130,12 @@ const DEFAULT_STATE = {
   asrModel: 'iic/SenseVoiceSmall',
   /** 说：模型缓存目录（留空=系统默认；有些机器默认目录写不进去，要指到可写盘） */
   msCacheDir: '',
+  /** 说：纠错词表路径（留空 = 不启用；格式见 vocab.example.txt） */
+  vocabPath: '',
   /** 听：念多少字（默认 80，约 40 个汉字） */
   speakChars: 80,
+  /** 听：过程话念多少字（默认 40；一轮中间的短句用这个上限，最终回复仍用 speakChars） */
+  speakMidChars: 40,
   /** 看：手动（模型需要时才看）还是自动（画面变了就叫它看） */
   seeMode: 'manual',
   /** 看：自动模式两帧之间至少隔多少个 10 毫秒（这里存秒） */
@@ -169,12 +212,16 @@ const CONFIG_FIELDS = {
   asrDevice: { kind: 'enum', values: ['cuda', 'cpu'], label: '推理设备', hint: 'cuda=快、占约 1.1 GB 显存；cpu=不占显存、慢一些（打游戏想腾显存时切这个）' },
   vadThreshold: { kind: 'number', min: 0.002, max: 0.2, label: '麦克风灵敏度阈值', hint: '默认 0.012；环境吵就调大' },
   silenceMs: { kind: 'number', min: 200, max: 3000, label: '静音多久算说完(ms)', hint: '默认 700' },
+  maxSec: { kind: 'number', min: 5, max: 600, label: '一句话最长几秒', hint: '默认 60；只在一直有声音时才生效，到点强制收尾。想回到旧行为填 15（但那样就攒不到 20 秒，分段识别用不上）' },
+  talkGain: { kind: 'number', min: 0.5, max: 20, label: '麦克风数字增益', hint: '默认 1（不放大）。虚拟麦克风（比如远程控制软件那种）拿不到硬件增益，电平只有真话筒的十分之一时往上调：8 ≈ +18dB。判定用的电平不受影响，只放大送去识别的那份' },
   targetMode: { kind: 'enum', values: ['auto', 'fixed'], label: '语音送到', hint: 'fixed=只进固定会话（防串台）；auto=跟随最近活动的会话' },
   targetSessionId: { kind: 'string', max: 120, label: '固定会话 id', hint: 'targetMode=fixed 时用；在下面的下拉里选' },
   showPill: { kind: 'enum', values: ['true', 'false'], label: '录音时显示小条', hint: 'false=不显示，只用提示音（热键模式下推荐）' },
   msCacheDir: { kind: 'string', max: 400, label: '模型缓存目录', hint: '留空用系统默认；如果引擎报 model not registered，把它指到可写目录（例如 D:/mc/mscache）' },
+  vocabPath: { kind: 'string', max: 400, label: '纠错词表', hint: '留空 = 不启用。填一个纯文本文件路径，格式见 vocab.example.txt；改文件内容不用重启，改路径要重启引擎' },
   asrModel: { kind: 'string', max: 200, label: '识别模型', hint: '默认 iic/SenseVoiceSmall（快、够用）；长句同音字容易错，可换成更大的模型，见 README「识别精度」' },
   speakChars: { kind: 'number', min: 10, max: 600, label: '念多少字', hint: '默认 80（约 40 个汉字）；只念回答的开头这一段' },
+  speakMidChars: { kind: 'number', min: 10, max: 600, label: '过程话念多少字', hint: '默认 40；一轮中间那些短句用这个上限，最终回复仍用上面那条' },
   seeMode: { kind: 'enum', values: ['manual', 'auto'], label: '看屏幕的方式', hint: 'manual=模型判断需要时才看；auto=画面变化后自动送一帧进来（打游戏用这个）' },
   seeMinGapSec: { kind: 'number', min: 3, max: 120, label: '自动模式最短间隔(秒)', hint: '默认 15；再剧烈也不会比这更频繁' },
   seeAutoDiff: { kind: 'number', min: 1, max: 60, label: '自动模式变化阈值', hint: '默认 8；越小越敏感（也越费）' },
@@ -348,7 +395,7 @@ export function apply(ctx) {
           Object.assign(state, check.patch)
           if (!writeState(state)) return sendJson(response, 500, { ok: false, error: 'state-write-failed' })
           // 模式/阈值这类参数是引擎**启动时**读的，改了必须重启引擎才生效
-          const needsEngineRestart = ['talkMode', 'vadThreshold', 'silenceMs', 'pythonPath', 'asrDevice'].some((k) => k in check.patch)
+          const needsEngineRestart = ['talkMode', 'vadThreshold', 'silenceMs', 'pythonPath', 'asrDevice', 'maxSec', 'vocabPath', 'talkGain'].some((k) => k in check.patch)
           const needsWatchRestart = ['seeMode', 'seeEvery', 'seeAutoDiff', 'seeMinGapSec', 'seePace'].some((k) => k in check.patch)
           if (needsWatchRestart && typeof syncWatch === 'function') {
             await syncWatch().catch(() => {})
@@ -559,6 +606,49 @@ function registerEar(ctx) {
 
     const origin = () => host.webServer?.getOrigin?.() ?? 'http://127.0.0.1:3080'
 
+    /**
+     * 此刻走到哪一步。
+     *
+     * 两个来源，**不比优先级、只比时间** —— 新事件自然盖掉旧的。优先级表是死规则，
+     * 迟早跟真实顺序打架（比如上一轮的 thinking 还新鲜、这一轮刚开始在收）。
+     *
+     * 引擎那半边还要过一道心跳：引擎崩了以后 ear.stage 还留着最后一次的 listening，
+     * 只看文件会一直显示"在收"，那是最容易把人骗过去的一种假象。
+     */
+    const currentStage = () => {
+      const now = Date.now()
+      const cands = []
+      try {
+        const hb = statSync(earHeartbeatFile(rootDir))
+        if (now - hb.mtimeMs < 20000) {
+          const raw = JSON.parse(readFileSync(earStageFile(rootDir), 'utf8'))
+          const at = Number(raw?.ts ?? 0)
+          const s = String(raw?.stage ?? '')
+          if (STAGES.has(s) && Number.isFinite(at) && at > 0) {
+            cands.push({ stage: s, at, detail: String(raw?.detail ?? ''), source: 'engine' })
+          }
+        }
+      } catch {
+        /* 没有引擎、或者还没写过 —— 不是错，语音关着本来就这样 */
+      }
+      if (stageState.at > 0 && STAGES.has(stageState.stage)) {
+        cands.push({ stage: stageState.stage, at: stageState.at, detail: stageState.detail, source: 'host', ttl: stageState.ttl })
+      }
+      if (cands.length === 0) return { stage: 'idle', at: 0, age: null, detail: '', source: 'none' }
+      // delivered 有"最小停留"：它常常只存在几十毫秒就被 thinking 顶掉，
+      // 外面按 200 ms 轮询根本抓不到。宁可在"想"前面多亮 1.5 秒，也别让它一闪而过。
+      const delivered = cands.find((c) => c.stage === 'delivered')
+      if (delivered !== undefined && now - delivered.at < STAGE_TTL.delivered) {
+        return { stage: 'delivered', at: delivered.at, age: now - delivered.at, detail: delivered.detail, source: delivered.source }
+      }
+      cands.sort((a, b) => b.at - a.at)
+      const top = cands[0]
+      const age = now - top.at
+      const ttl = top.ttl || STAGE_TTL[top.stage] || 60000
+      if (age > ttl) return { stage: 'idle', at: top.at, age, detail: '', source: top.source, stale: top.stage }
+      return { stage: top.stage, at: top.at, age, detail: top.detail, source: top.source }
+    }
+
     const ensure = async () => {
       const mod = await api()
       // 固定会话：配置改了立刻生效（不用重启），并优先于"最近活动"
@@ -608,6 +698,8 @@ function registerEar(ctx) {
           if (text === '') return sendJson(response, 400, { ok: false, error: 'empty-text' })
           const mod = await api()
           const r = mod.injectText(host, text)
+          // 送进去了：亮一下 delivered。保持 1.5 秒，不然外面轮询根本看不见它。
+          if (r.ok) setStage('delivered', text.slice(0, 24), STAGE_TTL.delivered)
           return sendJson(response, r.ok ? 200 : 503, { ...r, text })
         },
       },
@@ -757,6 +849,28 @@ function registerEar(ctx) {
           })
         },
       },
+      {
+        /**
+         * 「话筒到嘴」的当前阶段。给外面看的唯一入口 —— 桌宠、浮窗、桥，都问这一个。
+         *
+         * 只出事实，不出建议：没有颜色、没有该播哪个动画。怎么用是这个接口的调用方的事，
+         * 一旦这里开始规定"紫色该配什么"，接第二家就得再改一次。
+         */
+        kind: 'exact',
+        path: `${API}/stage`,
+        handler(request, response) {
+          if (!loopbackOnly(request)) return sendJson(response, 403, { ok: false, error: 'loopback-only' })
+          const state = readState()
+          const cur = currentStage()
+          return sendJson(response, 200, {
+            ok: true,
+            ...cur,
+            // 这两项让外面能判断"后面还会不会有下一段"：全关着的时候就停在 idle 了。
+            talk: state.talk === true,
+            hear: state.hear === true,
+          })
+        },
+      },
     ]
     for (const route of routes) {
       host.effect(() => host.webServer.register(route), `playmate:route:${route.path}`)
@@ -865,13 +979,49 @@ function registerHear(ctx) {
     /** 每个会话这一轮攒下来的回答文字 */
     const drafts = new Map()
 
+    /** 只念目标会话的话；limit 为空 = 用「念多少字」。
+     *  念出去之后顺手把阶段推到 speaking —— 只有这里知道"真的出声了"。 */
+    const speakIfTarget = (sid, text, limit) => {
+      if (String(text ?? '').trim() === '') return false
+      const state = readState()
+      // 固定会话时，只念那个会话的回答，别把别的窗口的话念出来
+      if (state.targetMode === 'fixed' && String(state.targetSessionId ?? '') !== '' && sid !== state.targetSessionId) return false
+      void hear.speak(text, limit).then((r) => {
+        if (r?.ok === true) {
+          // 念多久：按字数估一段。估不准不要紧 —— 最坏是多亮一会儿，
+          // 不会卡死：currentStage 里有 TTL 兜底。
+          const line = String(r.line ?? '')
+          const ms = Math.min(20000, Math.max(1200, line.length * 170))
+          setStage('speaking', `${line.length} 字`, ms)
+        }
+      })
+      return true
+    }
+
+    /** 只有目标会话才改变阶段。别的窗口在跑，不该让这只宠物显示"在想"——
+     *  它跟"主人正在跟谁说话"是两件事。 */
+    const isTarget = (sid) => {
+      const st = readState()
+      if (st.targetMode === 'fixed' && String(st.targetSessionId ?? '') !== '' && sid !== st.targetSessionId) return false
+      return true
+    }
+
     try {
       host.on?.('agent/assistant-stream', (payload) => {
         const sid = String(payload?.agent?.session?.id ?? '')
         if (sid === '') return
         const frame = payload?.frame
         if (frame?.type === 'start') {
+          // 一轮里模型常分好几段说（先给一句、调工具、再补结论）。原来这里直接
+          // set(sid, '')，等于每开一段就把上一段抹掉，最终只剩最后一段被念出来。
+          // 现在改成：开新段之前，先把上一段按「过程话」的上限念出去。
+          const prev = drafts.get(sid) ?? ''
+          if (prev.trim() !== '') {
+            const mid = Number(readState().speakMidChars)
+            speakIfTarget(sid, prev, Number.isFinite(mid) && mid > 0 ? mid : 40)
+          }
           drafts.set(sid, '')
+          if (isTarget(sid)) setStage('thinking', '', STAGE_TTL.thinking)
           return
         }
         if (frame?.type === 'chunk' && frame.chunk?.type === 'text-delta' && typeof frame.chunk.text === 'string') {
@@ -883,11 +1033,14 @@ function registerHear(ctx) {
         const sid = String(payload?.agent?.session?.id ?? '')
         const text = drafts.get(sid) ?? ''
         drafts.delete(sid)
-        if (text.trim() === '') return
-        const state = readState()
-        // 固定会话时，只念那个会话的回答，别把别的窗口的话念出来
-        if (state.targetMode === 'fixed' && String(state.targetSessionId ?? '') !== '' && sid !== state.targetSessionId) return
-        void hear.speak(text)
+        if (!isTarget(sid)) return
+        if (text.trim() === '') {
+          setStage('idle')
+          return
+        }
+        // 念不念由 speakIfTarget 决定（它自己会判断目标会话）；
+        // 真的念出去了，它顺手把阶段推到 speaking。
+        if (speakIfTarget(sid, text) !== true) setStage('idle', 'speak-skip')
       })
       log('[dsh-playmate/hear] 已挂上会话输出钩子')
     } catch (e) {

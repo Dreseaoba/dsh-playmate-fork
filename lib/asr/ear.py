@@ -42,6 +42,151 @@ TAG_RE = re.compile(r"<\|[^|]+\|>")
 
 import tempfile
 
+# ---- 长句分段识别 ------------------------------------------------------
+# 为什么：SenseVoiceSmall 训练以短句为主，一段话越长，解码时注意力越摊薄，
+# 漏字/错字越多（实测 16 s 内一个错都没有，32/48/64 s 开始零星漏）。
+# 切短了识别更稳，而且错误不累积。
+MAX_CHUNK_SEC = 20.0      # 超过这个长度就切
+CUT_SEARCH_FROM = 0.55    # 切点只在「后 45%」里找，保证每段别太短
+CUT_WIN_SEC = 0.15        # 判定"这里是不是停顿"的窗口
+
+
+def split_audio(audio, max_sec=MAX_CHUNK_SEC):
+    """把长音频切成若干段，切点优先落在能量最低的地方（相当于找停顿）。"""
+    max_len = int(max_sec * SR)
+    if audio is None or len(audio) <= max_len:
+        return [audio] if audio is not None else []
+
+    win = int(CUT_WIN_SEC * SR)
+    hop = int(0.05 * SR)
+    chunks = []
+    start = 0
+    while start < len(audio):
+        end = min(start + max_len, len(audio))
+        if end < len(audio) and end - start > win * 2:
+            lo = start + int((end - start) * CUT_SEARCH_FROM)
+            best_pos, best_e = end, None
+            for p in range(lo, end - win, hop):
+                seg = audio[p:p + win]
+                e = float(np.sqrt(np.mean(np.square(seg))) + 1e-9)
+                if best_e is None or e < best_e:
+                    best_e, best_pos = e, p + win // 2
+            end = best_pos
+        chunks.append(audio[start:end])
+        start = end
+    return [c for c in chunks if len(c) > 0]
+
+
+# ---- 纠错词表 ----------------------------------------------------------
+# 语音识别对专有名词、英文缩写、同音字一向不稳。这是留给使用者的入口：
+# 一个纯文本词表，每次识别前重读一遍（改完不用重启引擎）。
+# 格式见仓库根目录的 vocab.example.txt。路径由 PLAY_VOCAB 指定；不指定则不启用。
+VOCAB_PATH = os.environ.get("PLAY_VOCAB", "").strip()
+
+
+def load_vocab(path=VOCAB_PATH):
+    """读词表。
+
+    返回 (显式替换, 正则规则, 热词表)：
+      显式替换 [(错, 对)]
+      正则     [(模式, 替换)]
+      热词表   [正确词]  —— 取自每条规则的右值，供拼音模糊匹配兜底
+
+    为什么右值也要拿来当热词：模糊匹配（阈值 0.85）能抓住只差声母韵母的近音写法，
+    不用一个个把错写法列出来。但它够不着差得远的，那种还是得靠左边的显式映射。
+    """
+    explicit, regexes, targets = [], [], []
+    if not path:
+        return explicit, regexes, targets
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=>" not in line:
+                    continue
+                left, right = line.split("=>", 1)
+                left, right = left.strip(), right.strip()
+                if left == "":
+                    # 左边留空 = 只加热词，不配错词：交给拼音模糊匹配去抓近音写法，
+                    # 不用提前想它会错成什么样。
+                    if right and right not in targets:
+                        targets.append(right)
+                    continue
+                if left.startswith("re:"):
+                    regexes.append((left[3:].strip(), right))
+                else:
+                    explicit.append((left, right))
+                    if right and right not in targets:
+                        targets.append(right)
+    except Exception:
+        pass
+    return explicit, regexes, targets
+
+
+def build_matcher(targets, threshold=0.85):
+    """拼音模糊匹配器；词表为空、或环境里跑不了时返回 None（只用显式替换）。"""
+    if not targets:
+        return None
+    try:
+        from funasr.utils.postprocess_hotwords import build_postprocess_hotword_matcher
+
+        return build_postprocess_hotword_matcher(
+            postprocess_hotwords=targets,
+            postprocess_hotword_threshold=threshold,
+        )
+    except Exception as e:
+        log(f"热词匹配器建不起来（{type(e).__name__}: {e}），只用显式替换")
+        return None
+
+
+_MATCHER_CACHE = {"key": None, "matcher": None}
+
+
+def get_matcher(targets, threshold=0.85):
+    """带缓存的匹配器：词表内容不变就复用。
+
+    注意成本构成：建表本身是毫秒级，但**第一次** import
+    funasr.utils.postprocess_hotwords 很贵（它会把 funasr 一大片拽进来）。
+    所以启动时先 warmup_matcher() 把这笔开销吃掉，别让它落在第一句话上。
+    """
+    key = (tuple(sorted(targets)), threshold)
+    if _MATCHER_CACHE["key"] == key:
+        return _MATCHER_CACHE["matcher"]
+    m = build_matcher(targets, threshold)
+    _MATCHER_CACHE["key"] = key
+    _MATCHER_CACHE["matcher"] = m
+    return m
+
+
+def warmup_matcher():
+    targets = load_vocab()[2]
+    if not targets:
+        return
+    t0 = time.time()
+    get_matcher(targets)
+    log(f"热词匹配器预热完成（{time.time() - t0:.1f}s，热词 {len(targets)} 个）")
+
+
+def apply_vocab(text, rules, matcher=None):
+    """显式替换 → 正则 → 拼音模糊兜底。顺序不能反：正则看的是原始上下文。"""
+    if not text:
+        return text
+    explicit, regexes, _targets = rules
+    for left, right in explicit:
+        text = text.replace(left, right)
+    for pat, rep in regexes:
+        try:
+            text = re.sub(pat, rep, text)
+        except Exception:
+            continue
+    if matcher is not None:
+        try:
+            text, _matches = matcher.apply_text(text)
+        except Exception:
+            pass
+    return text
+
+
 _LOG_DIR = pathlib.Path(tempfile.gettempdir()) / "dsh-playmate"
 LOG_PATH = pathlib.Path(os.environ.get("PLAY_EAR_LOG", str(_LOG_DIR / "ear.log")))
 
@@ -53,6 +198,44 @@ HB_PATH = pathlib.Path(os.environ.get("PLAY_EAR_HEARTBEAT", str(_LOG_DIR / "ear.
 # 模式文件：ptt / always。改了它，引擎**不用重启**就能换模式
 # （重启一次要重新加载模型，25 秒；换文件是毫秒级）
 MODE_FILE = pathlib.Path(os.environ.get("PLAY_EAR_MODE_FILE", str(_LOG_DIR / "ear.mode")))
+# 阶段文件：此刻「话筒到嘴」走到哪一步，宿主在 /api/playmate/stage 里读它。
+# 为什么不读日志：日志格式是内部细节，谁也没承诺过它稳定；这个文件是给外面看的契约，
+# 字段改之前得先想清楚。写得也便宜——一句话最多改三次，不是轮询着写。
+STAGE_PATH = pathlib.Path(os.environ.get("PLAY_EAR_STAGE", str(_LOG_DIR / "ear.stage")))
+
+# ---- 我说话时抬门槛（本地专用，2026-11-10 加）---------------------------
+# 问题：TTS 播放的声音会经喇叭/耳机漏一点进麦克风（实测峰值约 0.026，低于
+# 0.04 的阈值，平时触发不了）。可一旦主人在说话，录音窗口打开，那点声音
+# 就一起被录进去，识别结果变成"她的话 + 我的话"混在一起。
+# 做法：edge-say 播放期间写一个旗标文件，这里读到就把门槛抬起来。
+# 注意：这依赖本机的 edge-say 服务，属于"本地专用"而不是发给别人的 feature，
+# 所以它不进任何 PR 分支，只在本地基线上。
+SPEAK_FLAG = os.environ.get("SAY_FLAG", str(_LOG_DIR / "tts-speaking.flag"))
+TTS_BOOST_THRESHOLD = 0.10
+# 另一条线：我说话时，"这拍要不要录进缓冲区"用的是更低的门槛。
+# 两件事不能共用一个数（2026-11-10 踩过）：她在我说话中间接话，后半句音量
+# 掉到 0.10 以下就被当成我的漏音丢掉，句子被拦腰截断。
+# 我的漏音峰值约 0.03，所以 0.05 足够分开。
+TTS_APPEND_FLOOR = 0.05
+
+_tts_cache = {"t": 0.0, "v": False}
+
+
+def tts_is_playing():
+    """我是不是正在说话。带 0.5 秒缓存，别每拍都去 stat 一次文件。"""
+    now = time.time()
+    if now - _tts_cache["t"] < 0.5:
+        return _tts_cache["v"]
+    playing = False
+    try:
+        st = os.stat(SPEAK_FLAG)
+        # 文件在、而且是最近写的才算——防止进程崩了留下残骸把门槛一直抬着
+        playing = (now - st.st_mtime) < 60
+    except Exception:
+        playing = False
+    _tts_cache["t"] = now
+    _tts_cache["v"] = playing
+    return playing
 
 
 def desired_mode(fallback):
@@ -70,6 +253,23 @@ def beat():
     try:
         HB_PATH.parent.mkdir(parents=True, exist_ok=True)
         HB_PATH.write_text(f"{os.getpid()} {time.time():.1f}", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def stage(name, detail=""):
+    """把当前阶段写出去，给宿主和外部（桌宠之类）看。
+
+    写失败绝不影响听 —— 这条路本来就是"有了更好，没有也得能说话"。
+    ts 用毫秒：宿主按它判"这条状态还新鲜吗"，过期的就当没发生，不会卡在某个态上。
+    """
+    try:
+        STAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STAGE_PATH.write_text(
+            json.dumps({"stage": name, "ts": int(time.time() * 1000), "detail": str(detail)},
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
     except Exception:
         pass
 
@@ -97,7 +297,7 @@ def rms(x):
 
 
 class Ear:
-    def __init__(self, mode, host, ctl, threshold, silence_ms, max_sec, model="iic/SenseVoiceSmall"):
+    def __init__(self, mode, host, ctl, threshold, silence_ms, max_sec, model="iic/SenseVoiceSmall", gain=1.0):
         self.model_name = model
         self.base_threshold = float(threshold) if threshold else 0.012
         self.mode = mode
@@ -106,7 +306,24 @@ class Ear:
         self.threshold = threshold
         self.silence_blocks = max(1, int(silence_ms / 1000 / BLOCK))
         self.max_blocks = int(max_sec / BLOCK)
+        # 数字增益：只放大「送给识别」的那份音频，VAD 判定仍然按原始电平。
+        # 为什么要分开：虚拟麦克风（远程控制软件装的那种）没有硬件增益，
+        # 音量滑杆到 100% 就是数字满刻度，实测说话只有 0.025 —— 判定能过，
+        # 但送进 SenseVoice 的音量太低，识别会糊。乘上去的是同一段声音，
+        # 阈值语义不变，就不用跟着改表。
+        try:
+            g = float(gain)
+        except (TypeError, ValueError):
+            g = 1.0
+        self.gain = g if g > 0 else 1.0
         self.model = None
+
+    def amp(self, x):
+        """把一段音频按增益放大，并防削波。gain=1 时原样返回。"""
+        if self.gain == 1.0:
+            return x
+        return np.clip(x * self.gain, -1.0, 1.0)
+
 
     def load(self):
         from funasr import AutoModel
@@ -124,6 +341,7 @@ class Ear:
         self.model = AutoModel(model=target, disable_update=True, device=device)
         log(f"模型来源：{target}（device={device}）")
         log(f"识别模型就绪（{time.time() - t0:.1f}s；模式={self.mode}；阈值={self.threshold}）")
+        warmup_matcher()
 
     def asr(self, audio):
         import tempfile
@@ -163,31 +381,68 @@ class Ear:
 
     def send(self, text):
         if not text:
-            return
+            return False
         body = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(self.host + "/api/playmate/heard", data=body,
                                      headers={"Content-Type": "application/json; charset=utf-8"})
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 log(f"发送 -> {r.read().decode('utf-8', 'ignore')[:120]}")
+                return True
         except Exception as e:
             log(f"发送失败：{e}")
+            return False
 
     @staticmethod
     def meaningful(text):
-        """只有标点/空白的结果不算话（实测：一声杂音会被识别成 '。'）。"""
-        return re.search(r"[0-9A-Za-z一-鿿]", text or "") is not None
+        """太短的结果不算话。
+
+        原来只滤「纯标点 / 空白」——一声杂音常被识别成「。」。但单字的误识别率
+        同样高：环境音常被认成「嗯」「好」，然后整条投递出去，等于凭空多了一轮
+        没人说过的对话。
+
+        改成要求至少两个实字（汉字 / 字母 / 数字）。代价是真正只说一个字时也会
+        被丢掉——「嗯」「好」这类一字回应听不到了；更想要那种极短回应的话，把
+        下面的 2 改回 1 即可。
+        """
+        core = re.findall(r"[0-9A-Za-z一-鿿]", text or "")
+        return len(core) >= 2
 
     def transcribe_and_send(self, buf):
         if len(buf) * BLOCK < 0.45:
             log(f"太短（{len(buf) * BLOCK:.2f}s），丢掉")
+            stage("idle", "too-short")
             return
         audio = np.concatenate(buf) if buf else np.zeros(0)
-        text = self.asr(audio)
+        stage("transcribing", f"{len(buf) * BLOCK:.1f}s")
+        # 长句切段识别，切点落在能量最低处（尽量对齐停顿）
+        chunks = split_audio(audio)
+        if len(chunks) > 1:
+            log(f"分段识别：{len(audio) / SR:.1f}s → {len(chunks)} 段")
+        parts = []
+        for ch in chunks:
+            t = self.asr(ch)
+            if t:
+                parts.append(t)
+        text = "".join(parts).strip()
+        # 纠错词表（每次重读，改完不用重启；匹配器有缓存，词表变了才重建）
+        # 顺序在分段之后：先拿到尽量完整的文本，再统一纠错。
+        rules = load_vocab()
+        if rules[0] or rules[1] or rules[2]:
+            fixed = apply_vocab(text, rules, get_matcher(rules[2]))
+            if fixed != text:
+                log(f"词表纠错：{text[:40]!r} → {fixed[:40]!r}")
+            text = fixed
         if not self.meaningful(text):
             log(f"没有实际内容（{text!r}），不发送")
+            stage("idle", "no-content")
             return
-        self.send(text)
+        if not self.send(text):
+            # 送不出去就别把状态停在「识别中」，否则外面看起来像卡住了
+            stage("idle", "send-failed")
+            return
+        # 送成功了也不写 delivered —— 那是宿主收到之后才写的事，
+        # 这一层只知道自己发出去了。宿主那边还没接住的空档，交给它自己判断。
 
     # ---- 常驻听 ----
     def run_always(self):
@@ -222,19 +477,28 @@ class Ear:
                     log(f"电平峰值 {peak:.4f}（阈值 {threshold:.4f}）")
                     peak, last_report = 0.0, time.time()
 
-                loud = level >= threshold
+                # 我说话的时候抬门槛，别把自己的声音录进去（见 tts_is_playing）
+                loud = level >= (TTS_BOOST_THRESHOLD if tts_is_playing() else threshold)
                 if not speaking:
                     # 连续两拍够响才算"开口"：单拍也可能是咔哒声
                     if loud:
                         voiced += 1
                         if voiced >= 2:
-                            speaking, buf, quiet = True, [mono], 0
+                            speaking, buf, quiet = True, [self.amp(mono)], 0
                             log(f"听到说话（{level:.3f}）")
+                            stage("listening", f"{level:.3f}")
                     else:
                         voiced = 0
                     continue
                 # 已经在说话：攒帧，静音够了就收尾
-                buf.append(mono)
+                # 关键（2026-11-10）：我这边开始说话的时候，静音的拍不进缓冲区。
+                # 原因：她说完后进 1.5 s 静音等待，这段时间我的 TTS 已经在播了，
+                # 那点漏音（0.02~0.03）不算 loud、却照样被 append 进来，
+                # 结果整段送去识别时把「我说的话」也一起转写了。
+                # 我说话时：静音拍不进缓冲区，但留一个低门槛，别把她接话的
+                # 后半句（音量可能掉到 0.08 以下）整段吃掉。见 TTS_APPEND_FLOOR。
+                if loud or (not tts_is_playing()) or level >= TTS_APPEND_FLOOR:
+                    buf.append(self.amp(mono))
                 quiet = 0 if loud else quiet + 1
                 if quiet >= self.silence_blocks or len(buf) >= self.max_blocks:
                     log(f"一句结束（{len(buf) * BLOCK:.1f}s）")
@@ -286,6 +550,7 @@ class Ear:
                 continue
             last = cmd
             log("按下：打开麦克风开始录")
+            stage("listening", "ptt")
             buf, speech_seen, quiet = [], False, 0
             threshold = 0.02
             done = False
@@ -304,7 +569,7 @@ class Ear:
                     while not done:
                         blk, _ = stream.read(int(SR * BLOCK))
                         mono = blk[:, 0].copy()
-                        buf.append(mono)
+                        buf.append(self.amp(mono))
                         level = rms(mono)
                         if level >= threshold * 1.4:
                             speech_seen = True
@@ -333,6 +598,7 @@ class Ear:
                 continue
             if not speech_seen:
                 log("只录到底噪，没有讲话，丢掉")
+                stage("idle", "no-speech")
                 continue
             log(f"结束：{len(buf) * BLOCK:.1f}s，开始识别")
             self.transcribe_and_send(buf)
@@ -410,7 +676,10 @@ def main():
     ap.add_argument("--ctl", default="")
     ap.add_argument("--threshold", type=float, default=0.012)
     ap.add_argument("--silence-ms", type=int, default=700)
-    ap.add_argument("--max-sec", type=float, default=15)
+    # 录音缓冲的硬上限，只在"一直有声音"时才起作用（正常说完静音 700 ms 就收尾）。
+    # 它必须大于 MAX_CHUNK_SEC，否则永远攒不满一段、分段识别一次都跑不到。
+    ap.add_argument("--max-sec", type=float, default=60)
+    ap.add_argument("--gain", type=float, default=float(os.environ.get("PLAY_EAR_GAIN", "1") or 1))
     ap.add_argument("--model", default=os.environ.get("PLAY_ASR_MODEL", "iic/SenseVoiceSmall"))
     a = ap.parse_args()
     beat()
@@ -421,9 +690,10 @@ def main():
     holder = claim_port()
     if holder is None:
         return
-    ear = Ear(a.mode, a.host, a.ctl, a.threshold, a.silence_ms, a.max_sec, a.model)
-    log(f"启动 mode={a.mode} host={a.host} th={a.threshold}")
+    ear = Ear(a.mode, a.host, a.ctl, a.threshold, a.silence_ms, a.max_sec, a.model, a.gain)
+    log(f"启动 mode={a.mode} host={a.host} th={a.threshold} gain={a.gain}")
     ear.load()
+    stage("idle", f"ready:{a.mode}")
     # 模型只加载一次；之后靠模式文件热切换（改文件 = 毫秒级，不用重启）
     mode = desired_mode(a.mode)
     while True:
